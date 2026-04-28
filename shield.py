@@ -8,16 +8,18 @@ from gevent.event import Event
 
 
 def shield(exception_type=GreenletExit, suppress=False):
-    def decorator(func: Callable[...]) -> Callable[...]:
+    def decorator[**P, R](func: Callable[P, R]) -> Callable[P, R]:
         if isgeneratorfunction(func):
+            _shield = GeneratorShield(exception_type, suppress)
             @wraps(func)
-            def wrapper(*args, **kwargs):
-                yield from GeneratorShield(exception_type, suppress).execute(func, *args, **kwargs)
+            def wrapper(*args: P.args, **kwargs: P.kwargs):
+                yield from _shield.execute(func, *args, **kwargs)
         else:
+            _shield = FunctionShield(exception_type, suppress)
             @wraps(func)
-            def wrapper(*args, **kwargs):
-                return FunctionShield(exception_type, suppress).execute(func, *args, **kwargs)
-            
+            def wrapper(*args: P.args, **kwargs: P.kwargs):
+                return _shield.execute(func, *args, **kwargs)
+
         return wrapper
 
     return decorator
@@ -39,9 +41,7 @@ class _Shield:
 
 
 class FunctionShield(_Shield):
-    def execute(self, func, *args, **kwargs):
-        reraise = not self.suppress
-        
+    def execute[**P, R](self, func: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
         exception = None
 
         def wrapper():
@@ -50,34 +50,14 @@ class FunctionShield(_Shield):
                 return func(*args, **kwargs)
             except Exception as e:
                 exception = e
-                return
+                return None
 
         g = spawn(wrapper)
 
-        try:
-            g.join()
-        except self.exception_type as e:
-            if reraise:
-                signals = []
-                while True:
-                    try:
-                        g.join()
-                        break
-                    except self.exception_type as e:
-                        signals.append(e)
-                        continue
-
-                cur = getcurrent()
-                if isinstance(cur, Greenlet):
-                    for signal in signals:
-                        cur.kill(signal, block=False)
-            else:
-                while True:
-                    try:
-                        g.join()
-                        break
-                    except self.exception_type as e:
-                        continue
+        if self.suppress:
+            _suppress_wait(g.join, self.exception_type)
+        else:
+            _wait(g.join, self.exception_type)
 
         if exception:
             raise exception
@@ -86,7 +66,7 @@ class FunctionShield(_Shield):
 
 
 class GeneratorShield(_Shield):
-    def execute(self, func, *args, **kwargs):
+    def execute[**P, R](self, func: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
         in_ = Event()
         out = Event()
 
@@ -96,8 +76,6 @@ class GeneratorShield(_Shield):
         done = False
         exception = None
         closed = False
-
-        reraise = not self.suppress
 
         def inner():
             nonlocal yielded, received, done, exception, closed
@@ -115,12 +93,12 @@ class GeneratorShield(_Shield):
                     in_.clear()
                     if closed:
                         generator.close()
-                        break
+                        return
 
                     try:
                         yielded = generator.send(received)
-                    except StopIteration:
-                        break
+                    except StopIteration as e:
+                        return e.value
 
                     received = None
             except Exception as e:
@@ -130,36 +108,15 @@ class GeneratorShield(_Shield):
                 out.set()
                 done = True
 
+        if self.suppress:
+            out_wait = _suppress_wait
+        else:
+            out_wait = _wait
+
         g = spawn(inner)
 
         while True:
-            try:
-                out.wait()
-            except self.exception_type as e:
-                if reraise:
-                    signals = [e]
-
-                    while True:
-                        try:
-                            out.wait()
-                            break
-                        except self.exception_type as e:
-                            signals.append(e)
-                            continue
-
-                    cur = getcurrent()
-                    if isinstance(cur, Greenlet):
-                        for signal in signals:
-                            cur.kill(signal, block=False)
-
-                else:
-                    while True:
-                        try:
-                            out.wait()
-                            break
-                        except self.exception_type as e:
-                            continue
-
+            out_wait(out.wait, self.exception_type)
             out.clear()
             if done:
                 break
@@ -174,3 +131,33 @@ class GeneratorShield(_Shield):
             raise exception
 
         g.get()
+
+
+def _suppress_wait(wait_func, exec_type):
+    while True:
+        try:
+            wait_func()
+            break
+        except exec_type:
+            continue
+
+
+
+def _wait(wait_func, exec_type):
+    try:
+        wait_func()
+    except exec_type as signal:
+        signals = [signal]
+
+        while True:
+            try:
+                wait_func()
+                break
+            except exec_type as signal:
+                signals.append(signal)
+                continue
+
+        cur = getcurrent()
+        if isinstance(cur, Greenlet):
+            for signal in signals:
+                cur.kill(signal, block=False)

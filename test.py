@@ -163,13 +163,13 @@ def test5():
             count = i
             try:
                 i = g.send(i + 1)
-                sleep(0)
+                sleep(0.1)
             except StopIteration:
                 print("shield_func done")
                 break
 
     def kill(gx):
-        sleep(0.25)
+        sleep(0.35)
         print("kill")
         gx.kill()
     
